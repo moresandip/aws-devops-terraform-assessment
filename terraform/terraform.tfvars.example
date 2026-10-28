@@ -1,0 +1,38 @@
+# Production environment variable overrides
+# Copy this file to terraform.tfvars and fill in real values before running terraform apply
+
+aws_region   = "us-east-1"
+project_name = "devops-assessment"
+environment  = "prod"
+
+# ── Networking ────────────────────────────────
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+db_subnet_cidrs      = ["10.0.20.0/24", "10.0.21.0/24"]
+
+# ── EC2 / ASG ────────────────────────────────
+# Amazon Linux 2023 – us-east-1 (verify latest AMI ID before deploying)
+ec2_ami_id           = "ami-0c02fb55956c7d316"
+ec2_instance_type    = "t3.micro"
+ec2_key_pair_name    = ""            # Set to your key pair name for SSH access
+asg_min_size         = 2
+asg_max_size         = 6
+asg_desired_capacity = 2
+
+# ── ALB / ACM ────────────────────────────────
+domain_name     = "app.devops-assessment.example.com"
+certificate_arn = ""   # Leave blank to have Terraform request a new ACM cert
+
+# ── RDS ──────────────────────────────────────
+db_name              = "appdb"
+db_username          = "admin"
+db_instance_class    = "db.t3.micro"
+db_allocated_storage = 20
+db_multi_az          = true
+db_deletion_protection = true
+
+# ── S3 ───────────────────────────────────────
+app_s3_bucket_name     = "devops-assessment-app-storage"
+alb_logs_s3_bucket_name = "devops-assessment-alb-logs"

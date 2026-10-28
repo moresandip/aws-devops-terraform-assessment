@@ -1,0 +1,395 @@
+name: "Terraform CI/CD Pipeline"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action to perform"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+# Prevent concurrent runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION:     "1.6.4"
+  TF_WORKING_DIR: "./terraform"
+  AWS_REGION:     "us-east-1"
+
+permissions:
+  id-token:       write   # OIDC token for AWS auth
+  contents:       read
+  pull-requests:  write   # Post plan output as PR comment
+  security-events: write  # Upload Checkov SARIF
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Static Analysis & Security Scan
+  # ──────────────────────────────────────────────
+  security-scan:
+    name: "Security Scan (tfsec + Checkov)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.TF_WORKING_DIR }}
+          soft_fail: false
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_WORKING_DIR }}
+          framework: terraform
+          output_format: sarif
+          output_file_path: reports/checkov.sarif
+          soft_fail: false
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/checkov.sarif
+
+  # ──────────────────────────────────────────────
+  # 2. Terraform Format & Validate
+  # ──────────────────────────────────────────────
+  validate:
+    name: "Terraform Validate"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-terraform
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Comment format result on PR
+        if: github.event_name == 'pull_request' && steps.fmt.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '❌ **Terraform format check failed.** Run `terraform fmt -recursive` to fix.'
+            })
+
+      - name: Terraform Init
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform validate
+
+  # ──────────────────────────────────────────────
+  # 3. Terraform Plan
+  # ──────────────────────────────────────────────
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exit_code }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-terraform-plan
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform plan \
+            -var="domain_name=${{ secrets.DOMAIN_NAME }}" \
+            -var="certificate_arn=${{ secrets.ACM_CERTIFICATE_ARN }}" \
+            -var="ec2_key_pair_name=${{ secrets.EC2_KEY_PAIR_NAME }}" \
+            -out=tfplan \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Save plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/plan_output.txt
+          retention-days: 7
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan_output.txt', 'utf8');
+            const maxLen = 65000;
+            const truncated = output.length > maxLen
+              ? output.substring(0, maxLen) + '\n\n... (truncated)'
+              : output;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📋 Terraform Plan\n\n<details><summary>Show Plan</summary>\n\n\`\`\`\n${truncated}\n\`\`\`\n\n</details>\n\n*Workflow: \`${{ github.workflow }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`
+            });
+
+  # ──────────────────────────────────────────────
+  # 4. Terraform Apply (main branch only)
+  # ──────────────────────────────────────────────
+  apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment:
+      name: production
+      url: https://${{ secrets.DOMAIN_NAME }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-terraform-apply
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform apply -auto-approve tfplan
+
+      - name: Extract Terraform Outputs
+        id: tf_outputs
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+          echo "app_url=$(terraform output -raw app_url)"      >> $GITHUB_OUTPUT
+          echo "asg_name=$(terraform output -raw asg_name)"   >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────
+  # 5. Health Check & Smoke Tests
+  # ──────────────────────────────────────────────
+  health-check:
+    name: "Post-Deploy Health Check"
+    runs-on: ubuntu-latest
+    needs: apply
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for instances to be healthy
+        run: |
+          echo "Waiting 120s for EC2 instances to register with the target group..."
+          sleep 120
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-health-check
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Check ALB target health
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "devops-assessment-prod-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+
+          echo "Target Group ARN: $TG_ARN"
+
+          HEALTH=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TG_ARN" \
+            --query 'TargetHealthDescriptions[*].TargetHealth.State' \
+            --output text)
+
+          echo "Target health states: $HEALTH"
+
+          if echo "$HEALTH" | grep -qv "healthy"; then
+            echo "❌ Some targets are not healthy!"
+            exit 1
+          fi
+          echo "✅ All targets are healthy"
+
+      - name: HTTPS smoke test
+        run: |
+          APP_URL="https://${{ secrets.DOMAIN_NAME }}/health"
+          echo "Testing $APP_URL"
+
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              --retry 3 \
+              "$APP_URL" || echo "000")
+
+            echo "Attempt $i: HTTP $STATUS"
+
+            if [[ "$STATUS" == "200" ]]; then
+              echo "✅ Health check passed!"
+              exit 0
+            fi
+            sleep 15
+          done
+
+          echo "❌ Health check failed after 5 attempts"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Deployment Health Check Failed – Run #${{ github.run_id }}`,
+              body: `The post-deployment health check failed for commit \`${{ github.sha }}\`.\n\nPlease investigate: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['bug', 'deployment']
+            });
+
+  # ──────────────────────────────────────────────
+  # 6. Terraform Destroy (manual only)
+  # ──────────────────────────────────────────────
+  destroy:
+    name: "Terraform Destroy"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-actions-destroy
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Destroy
+        run: |
+          cd ${{ env.TF_WORKING_DIR }}
+          terraform destroy \
+            -var="domain_name=${{ secrets.DOMAIN_NAME }}" \
+            -var="certificate_arn=${{ secrets.ACM_CERTIFICATE_ARN }}" \
+            -var="db_deletion_protection=false" \
+            -auto-approve

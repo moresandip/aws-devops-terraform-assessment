@@ -1,0 +1,29 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+*.tfplan
+tfplan
+terraform.tfvars
+
+# Sensitive
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Node.js
+app/node_modules/
+app/coverage/
+app/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
